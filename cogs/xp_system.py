@@ -163,6 +163,24 @@ class XPSystem(commands.Cog):
             await interaction.followup.send(f"🗑️ Роль {role.mention} удалена из списка званий и физически снята с **{removed_count}** пользователей.")
         else:
             await interaction.followup.send(f"⚠️ Эта роль не найдена в базе званий.")
+
+    @app_commands.command(name="sync_ranks", description="[АДМИН] Принудительно обновить звания у всего клана")
+    @is_bot_admin()
+    async def sync_ranks(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        clan_role_id = self.bot.config["CLAN_ROLE_ID"]
+        
+        updated_count = 0
+        for member in interaction.guild.members:
+            if member.bot:
+                continue
+            if clan_role_id in [r.id for r in member.roles]:
+                await self.update_member_rank(member)
+                updated_count += 1
+                if updated_count % 10 == 0:
+                    await asyncio.sleep(0.2)
+                
+        await interaction.followup.send(f"✅ Синхронизация завершена! Проверено и обновлено бойцов: **{updated_count}**.")
     
     # ==========================================
     # ПРОФИЛЬ (Пользовательская команда)
@@ -176,6 +194,8 @@ class XPSystem(commands.Cog):
         if self.bot.config["CLAN_ROLE_ID"] not in [r.id for r in member.roles]:
             return await interaction.followup.send("Профиль доступен только участникам клана.")
             
+        await self.update_member_rank(member)
+
         achievements_cursor = await self.achievements.find().to_list(length=None)
         achievement_dict = {doc["_id"]: doc["xp"] for doc in achievements_cursor}
         total_xp = sum(achievement_dict[role.id] for role in member.roles if role.id in achievement_dict)
