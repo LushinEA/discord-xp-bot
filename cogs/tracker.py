@@ -10,7 +10,19 @@ import io
 import asyncio
 
 logger = logging.getLogger("SquadBot")
-SEED_THRESHOLD = 50 
+SEED_THRESHOLD = 50
+
+# Названия карт Squad - такие записи не являются реальным сервером и игнорируются
+SQUAD_MAP_NAMES = {
+    "anvil", "al basrah", "belaya", "black coast", "chora", "fallujah",
+    "fool's road", "fools road", "gorodok", "harju", "jensen's range",
+    "jensens range", "kamdesh highlands", "kamdesh", "kohat toi", "kohat",
+    "kokan", "lashkar valley", "lashkar", "logar valley", "logar",
+    "manicouagan", "manic-5", "mestia", "mutaha", "nanisivik", "narva",
+    "op first light", "pacific proving grounds", "sanxian islands", "sanxian",
+    "skorpo", "squamish valley", "squamish", "sumari bala", "sumari",
+    "tallil outskirts", "tallil", "yehorivka", "yamalia", "munduz",
+}
 
 PERIOD_CHOICES = [
     app_commands.Choice(name="За всё время", value="all"),
@@ -26,10 +38,10 @@ PERIOD_CHOICES = [
 class ActivityTracker(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.activity = self.bot.db.activity       
-        self.daily_activity = self.bot.db.daily_activity 
-        self.users = self.bot.db.users             
-        
+        self.activity = self.bot.db.activity
+        self.daily_activity = self.bot.db.daily_activity
+        self.users = self.bot.db.users
+
     async def cog_load(self):
         if not self.track_activity.is_running():
             self.track_activity.start()
@@ -38,13 +50,27 @@ class ActivityTracker(commands.Cog):
         self.track_activity.cancel()
 
     def parse_squad_info(self, activity):
+        """
+        Возвращает (server_name, is_seed) или (None, False) если запись не валидна
+        (Main Menu, название карты вместо сервера).
+        """
         raw_text = activity.large_image_text or activity.details or ""
         server_name = raw_text.split(" on ", 1)[1].strip() if " on " in raw_text else raw_text.strip() or "Main Menu"
+
+        # Пункт 1: игнорируем Main Menu
+        if server_name == "Main Menu":
+            return None, False
+
+        # Пункт 2: игнорируем записи, которые являются названием карты, а не сервера
+        if server_name.lower() in SQUAD_MAP_NAMES:
+            return None, False
+
         is_seed = False
         details = activity.details or ""
         match = re.search(r'\((\d+)/\d+\)', details)
         if match and int(match.group(1)) < SEED_THRESHOLD:
             is_seed = True
+
         return server_name.replace(".", "_").replace("$", ""), is_seed
 
     @tasks.loop(minutes=1)
@@ -52,6 +78,7 @@ class ActivityTracker(commands.Cog):
         now = datetime.datetime.utcnow()
         today_str = now.strftime('%Y-%m-%d')
         active_users = {}
+        processed_discord_ids = set()
         clan_role_id = self.bot.config["CLAN_ROLE_ID"]
 
         try:
@@ -63,10 +90,12 @@ class ActivityTracker(commands.Cog):
                 for member in guild.members:
                     count += 1
                     if count % 50 == 0:
-                        await asyncio.sleep(0.01) 
+                        await asyncio.sleep(0.01)
 
-                    if member.bot or member.id in active_users: 
+                    if member.bot or member.id in processed_discord_ids:
                         continue
+                    processed_discord_ids.add(member.id)
+
                     if clan_role_id not in [r.id for r in member.roles]:
                         continue
 
@@ -74,19 +103,24 @@ class ActivityTracker(commands.Cog):
                     if not steam_id:
                         continue
 
-                    current_squad = next((act for act in member.activities if act.name == "Squad" and isinstance(act, discord.Activity)), None)
-                    
+                    current_squad = next(
+                        (act for act in member.activities if act.name == "Squad" and isinstance(act, discord.Activity)),
+                        None
+                    )
+
                     if current_squad:
                         srv_name, is_seed = self.parse_squad_info(current_squad)
-                        active_users[steam_id] = {"server": srv_name, "is_seed": is_seed}
+                        # srv_name == None означает Main Menu или название карты — пропускаем
+                        if srv_name is not None:
+                            active_users[steam_id] = {"server": srv_name, "is_seed": is_seed}
 
             if active_users:
                 global_ops = []
                 daily_ops = []
-                
+
                 for steam_id, info in active_users.items():
                     prefix = "seeding" if info["is_seed"] else "battle"
-                    
+
                     global_ops.append(UpdateOne(
                         {"_id": str(steam_id)},
                         {
@@ -99,7 +133,7 @@ class ActivityTracker(commands.Cog):
                         },
                         upsert=True
                     ))
-                    
+
                     daily_ops.append(UpdateOne(
                         {"steam_id": str(steam_id), "date": today_str},
                         {
@@ -130,28 +164,40 @@ class ActivityTracker(commands.Cog):
     async def fetch_user_stats(self, steam_id: str, period: str):
         if period == "all":
             return await self.activity.find_one({"_id": steam_id})
-            
+
         target_date = (datetime.datetime.utcnow() - datetime.timedelta(days=int(period))).strftime('%Y-%m-%d')
         cursor = self.daily_activity.find({"steam_id": steam_id, "date": {"$gte": target_date}})
-        
+
         aggregated_data = {
             "total_battle_minutes": 0, "total_seeding_minutes": 0, "total_minutes": 0,
             "battle_servers": {}, "seeding_servers": {}
         }
-        
+
         has_data = False
         async for doc in cursor:
             has_data = True
             aggregated_data["total_minutes"] += doc.get("total_minutes", 0)
             aggregated_data["total_battle_minutes"] += doc.get("total_battle_minutes", 0)
             aggregated_data["total_seeding_minutes"] += doc.get("total_seeding_minutes", 0)
-            
+
             for srv, mins in doc.get("battle_servers", {}).items():
                 aggregated_data["battle_servers"][srv] = aggregated_data["battle_servers"].get(srv, 0) + mins
             for srv, mins in doc.get("seeding_servers", {}).items():
                 aggregated_data["seeding_servers"][srv] = aggregated_data["seeding_servers"].get(srv, 0) + mins
-                
+
         return aggregated_data if has_data else None
+
+    # ==========================================
+    # ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: аддитивный мёрж серверов
+    # ==========================================
+    def _merge_servers(self, data: dict) -> dict:
+        """Суммирует battle_servers и seeding_servers без перезаписи ключей."""
+        all_srv = {}
+        for srv, mins in data.get("battle_servers", {}).items():
+            all_srv[srv] = all_srv.get(srv, 0) + mins
+        for srv, mins in data.get("seeding_servers", {}).items():
+            all_srv[srv] = all_srv.get(srv, 0) + mins
+        return all_srv
 
     # ==========================================
     # КОМАНДЫ АДМИНИСТРАТОРА
@@ -161,16 +207,16 @@ class ActivityTracker(commands.Cog):
     @is_bot_admin()
     async def export_stats(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        
+
         users_cursor = await self.users.find().to_list(length=None)
         activity_cursor = await self.activity.find().to_list(length=None)
-        
+
         if not users_cursor:
             return await interaction.followup.send("База пользователей пуста.")
 
         act_dict = {doc["_id"]: doc for doc in activity_cursor}
         current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
+
         html = f"""
         <!DOCTYPE html>
         <html lang="ru">
@@ -225,7 +271,7 @@ class ActivityTracker(commands.Cog):
                 user_servers[srv_name] = user_servers.get(srv_name, 0) + mins
             for srv_name, mins in act.get("seeding_servers", {}).items():
                 user_servers[srv_name] = user_servers.get(srv_name, 0) + mins
-            
+
             sorted_servers = sorted(user_servers.items(), key=lambda x: x[1], reverse=True)
 
             server_html = "<ul class='server-list'>"
@@ -264,15 +310,15 @@ class ActivityTracker(commands.Cog):
     @is_bot_admin()
     async def link_user(self, interaction: discord.Interaction, member: discord.Member, steam_id: str, squad_nickname: str):
         await interaction.response.defer(ephemeral=True)
-        
+
         if await self.users.find_one({"discord_id": member.id}):
             return await interaction.followup.send(f"❌ Пользователь {member.mention} уже привязан к базе. Используйте `/edit_link` для изменения.")
-            
+
         if await self.users.find_one({"steam_id": steam_id}):
             return await interaction.followup.send(f"❌ Steam ID `{steam_id}` уже занят другим пользователем.")
 
         await self.users.insert_one({
-            "discord_id": member.id, 
+            "discord_id": member.id,
             "steam_id": steam_id,
             "discord_name": member.name,
             "squad_nickname": squad_nickname
@@ -283,10 +329,10 @@ class ActivityTracker(commands.Cog):
     @is_bot_admin()
     async def edit_link(self, interaction: discord.Interaction, member: discord.Member, new_steam_id: str, new_squad_nickname: str):
         await interaction.response.defer(ephemeral=True)
-        
+
         if not await self.users.find_one({"discord_id": member.id}):
             return await interaction.followup.send(f"❌ Пользователь {member.mention} не найден в базе. Используйте `/link_user`.")
-            
+
         conflict = await self.users.find_one({"steam_id": new_steam_id, "discord_id": {"$ne": member.id}})
         if conflict:
             return await interaction.followup.send(f"❌ Steam ID `{new_steam_id}` уже занят другим бойцом.")
@@ -301,28 +347,28 @@ class ActivityTracker(commands.Cog):
     @is_bot_admin()
     async def unlink_user(self, interaction: discord.Interaction, member: discord.Member):
         await interaction.response.defer(ephemeral=True)
-        
+
         result = await self.users.delete_one({"discord_id": member.id})
         if result.deleted_count > 0:
             await interaction.followup.send(f"🗑️ Привязка пользователя {member.mention} успешно удалена.")
         else:
             await interaction.followup.send(f"⚠️ Пользователь {member.mention} и так не был привязан к базе.")
 
-    @app_commands.command(name="check_user", description="[АДМИН] Посмотреть статистику конкретного бойца")
+    @app_commands.command(name="check_user", description="[АДМИН] Посмотреть статистику активности конкретного бойца")
     @app_commands.choices(period=PERIOD_CHOICES)
     @is_bot_admin()
     async def check_user(self, interaction: discord.Interaction, member: discord.Member, period: app_commands.Choice[str] = None):
         await interaction.response.defer()
         period_val = period.value if period else "all"
         period_name = period.name if period else "За всё время"
-        
+
         user_link = await self.users.find_one({"discord_id": member.id})
         if not user_link:
             return await interaction.followup.send("Этот пользователь не привязан к Steam ID.")
-        
+
         steam_id = user_link["steam_id"]
         squad_nick = user_link.get("squad_nickname", member.display_name)
-        
+
         data = await self.fetch_user_stats(steam_id, period_val)
         if not data:
             return await interaction.followup.send(f"Данных об активности за **{period_name}** нет.")
@@ -330,16 +376,18 @@ class ActivityTracker(commands.Cog):
         battle_h = data.get("total_battle_minutes", 0) / 60
         seed_h = data.get("total_seeding_minutes", 0) / 60
         total_h = data.get("total_minutes", 0) / 60
-        
-        embed = discord.Embed(title=f"Статистика: {squad_nick}", description=f"Steam ID: {steam_id}\nDiscord: {member.mention}\nПериод: **{period_name}**", color=0xe74c3c)
+
+        embed = discord.Embed(
+            title=f"Статистика: {squad_nick}",
+            description=f"Steam ID: {steam_id}\nDiscord: {member.mention}\nПериод: **{period_name}**",
+            color=0xe74c3c
+        )
         embed.add_field(name="⏱️ Всего", value=f"**{total_h:.1f} ч.**", inline=False)
         embed.add_field(name="⚔️ Бой", value=f"{battle_h:.1f} ч.", inline=True)
         embed.add_field(name="🌱 Сидинг", value=f"{seed_h:.1f} ч.", inline=True)
-        
-        all_srv = {**data.get("battle_servers", {}), **data.get("seeding_servers", {})}
-        top_srv = sorted(all_srv.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        top_srv = sorted(self._merge_servers(data).items(), key=lambda x: x[1], reverse=True)[:5]
         srv_str = "\n".join([f"• {n}: {m/60:.1f}ч" for n, m in top_srv]) or "Нет данных"
-        
         embed.add_field(name="Топ серверов", value=srv_str, inline=False)
         await interaction.followup.send(embed=embed)
 
@@ -353,34 +401,31 @@ class ActivityTracker(commands.Cog):
         await interaction.response.defer()
         period_val = period.value if period else "all"
         period_name = period.name if period else "За всё время"
-        
+
         user_link = await self.users.find_one({"discord_id": interaction.user.id})
         if not user_link:
             return await interaction.followup.send("Вы не привязаны к базе данных клана. Обратитесь к офицерам.")
-        
+
         steam_id = user_link["steam_id"]
         squad_nick = user_link.get("squad_nickname", interaction.user.display_name)
-        
+
         data = await self.fetch_user_stats(steam_id, period_val)
-        
         if not data:
             return await interaction.followup.send(f"Данных об активности за период **{period_name}** нет.")
 
         battle_h = data.get("total_battle_minutes", 0) / 60
         seed_h = data.get("total_seeding_minutes", 0) / 60
         total_h = data.get("total_minutes", 0) / 60
-        
+
         embed = discord.Embed(title=f"Твоя статистика: {squad_nick}", description=f"Период: **{period_name}**", color=0x2ecc71)
         embed.add_field(name="⏱️ Всего наиграно", value=f"**{total_h:.1f} ч.**", inline=False)
         embed.add_field(name="⚔️ Время в бою", value=f"**{battle_h:.1f} ч.**", inline=True)
         embed.add_field(name="🌱 Время сидинга", value=f"**{seed_h:.1f} ч.**", inline=True)
-        
-        all_srv = {**data.get("battle_servers", {}), **data.get("seeding_servers", {})}
-        top_srv = sorted(all_srv.items(), key=lambda x: x[1], reverse=True)[:3]
+
+        top_srv = sorted(self._merge_servers(data).items(), key=lambda x: x[1], reverse=True)[:3]
         if top_srv:
             srv_str = "\n".join([f"• {n}: {m/60:.1f}ч" for n, m in top_srv])
             embed.add_field(name="Любимые серверы", value=srv_str, inline=False)
-            
         await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="top_players", description="Показать топ 10 игроков по активности")
@@ -389,7 +434,7 @@ class ActivityTracker(commands.Cog):
         await interaction.response.defer()
         period_val = period.value if period else "all"
         period_name = period.name if period else "За всё время"
-        
+
         players = []
         if period_val == "all":
             cursor = self.activity.find().sort("total_minutes", -1).limit(10)
@@ -403,7 +448,7 @@ class ActivityTracker(commands.Cog):
                 {"$limit": 10}
             ]
             players = await self.daily_activity.aggregate(pipeline).to_list(length=10)
-        
+
         if not players:
             return await interaction.followup.send(f"Данных за период **{period_name}** пока нет.")
 
@@ -412,13 +457,11 @@ class ActivityTracker(commands.Cog):
 
         embed = discord.Embed(title=f"🏆 Топ 10 самых активных ({period_name})", color=0x3498db)
         description = ""
-        
         for i, p in enumerate(players, 1):
             steam_id = p["_id"]
             nick = steam_to_nick.get(steam_id, "Неизвестный боец")
             total_h = p.get("total_minutes", 0) / 60
             description += f"**{i}.** {nick} — **{total_h:.1f} ч.**\n"
-        
         embed.description = description
         await interaction.followup.send(embed=embed)
 
@@ -428,9 +471,9 @@ class ActivityTracker(commands.Cog):
         await interaction.response.defer()
         period_val = period.value if period else "all"
         period_name = period.name if period else "За всё время"
-        
+
         server_totals = {}
-        
+
         if period_val == "all":
             cursor = self.activity.find()
         else:
@@ -438,20 +481,20 @@ class ActivityTracker(commands.Cog):
             cursor = self.daily_activity.find({"date": {"$gte": target_date}})
 
         async for doc in cursor:
-            all_srv = {**doc.get("battle_servers", {}), **doc.get("seeding_servers", {})}
-            for srv_name, minutes in all_srv.items():
+            for srv_name, minutes in doc.get("battle_servers", {}).items():
                 server_totals[srv_name] = server_totals.get(srv_name, 0) + minutes
-                
+            for srv_name, minutes in doc.get("seeding_servers", {}).items():
+                server_totals[srv_name] = server_totals.get(srv_name, 0) + minutes
+
         if not server_totals:
             return await interaction.followup.send(f"Данных о серверах за **{period_name}** пока нет.")
 
         top_srv = sorted(server_totals.items(), key=lambda x: x[1], reverse=True)[:10]
-        
+
         embed = discord.Embed(title=f"🌍 Топ 10 серверов клана ({period_name})", color=0x9b59b6)
         description = ""
         for i, (srv_name, minutes) in enumerate(top_srv, 1):
             description += f"**{i}.** {srv_name} — **{minutes/60:.1f} ч.**\n"
-            
         embed.description = description
         await interaction.followup.send(embed=embed)
 
@@ -461,12 +504,12 @@ class ActivityTracker(commands.Cog):
         await interaction.response.defer()
         period_val = period.value if period else "all"
         period_name = period.name if period else "За всё время"
-        
+
         pipeline = []
         if period_val != "all":
             target_date = (datetime.datetime.utcnow() - datetime.timedelta(days=int(period_val))).strftime('%Y-%m-%d')
             pipeline.append({"$match": {"date": {"$gte": target_date}}})
-            
+
         pipeline.append({
             "$group": {
                 "_id": None,
@@ -475,27 +518,30 @@ class ActivityTracker(commands.Cog):
                 "overall_total": {"$sum": "$total_minutes"}
             }
         })
-        
+
         collection = self.activity if period_val == "all" else self.daily_activity
         result = await collection.aggregate(pipeline).to_list(length=1)
-        
+
         if not result:
             return await interaction.followup.send(f"Нет данных для статистики за **{period_name}**.")
-            
+
         stats = result[0]
         total_h = stats.get("overall_total", 0) / 60
         battle_h = stats.get("overall_battle", 0) / 60
         seed_h = stats.get("overall_seeding", 0) / 60
-        
-        player_count = len(await collection.distinct("steam_id" if period_val != "all" else "_id", pipeline[0]["$match"] if period_val != "all" else {}))
+
+        player_count = len(await collection.distinct(
+            "steam_id" if period_val != "all" else "_id",
+            pipeline[0]["$match"] if period_val != "all" else {}
+        ))
 
         embed = discord.Embed(title=f"📊 Глобальная статистика клана ({period_name})", color=0xf1c40f)
         embed.add_field(name="Всего наиграно", value=f"**{total_h:.1f} ч.**", inline=False)
         embed.add_field(name="В боях", value=f"{battle_h:.1f} ч.", inline=True)
         embed.add_field(name="На сидинге", value=f"{seed_h:.1f} ч.", inline=True)
         embed.set_footer(text=f"Активных бойцов за этот период: {player_count}")
-        
         await interaction.followup.send(embed=embed)
+
 
 async def setup(bot):
     await bot.add_cog(ActivityTracker(bot))
