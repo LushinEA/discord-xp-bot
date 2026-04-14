@@ -7,6 +7,9 @@ import asyncio
 
 logger = logging.getLogger("SquadBot")
 
+EMBED_DESCRIPTION_LIMIT = 4096
+
+
 class XPSystem(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -115,12 +118,118 @@ class XPSystem(commands.Cog):
             await self.update_member_rank(after)
 
     # ==========================================
+    # КОМАНДЫ: ПРОСМОТР ТАБЛИЦ (для всего клана)
+    # ==========================================
+
+    @app_commands.command(name="ranks_list", description="Показать таблицу всех воинских званий и требуемого опыта")
+    async def ranks_list(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        ranks_cursor = await self.ranks.find().sort("required_xp", 1).to_list(length=None)
+
+        if not ranks_cursor:
+            return await interaction.followup.send("В базе нет ни одного звания.")
+
+        embed = discord.Embed(
+            title="🎖️ Таблица воинских званий",
+            description="Список всех доступных воинских званий и опыт, необходимый для их получения.",
+            color=discord.Color.gold()
+        )
+
+        lines = []
+        for i, rank in enumerate(ranks_cursor):
+            role = interaction.guild.get_role(rank["_id"])
+            role_display = role.mention if role else f"`ID: {rank['_id']}`"
+            # Добавляем корону к последнему (максимальному) званию
+            #crown = " 👑" if i == len(ranks_cursor) - 1 else ""
+            lines.append(f"**{rank['required_xp']} XP** — {role_display}")
+
+        embed.description = "\n".join(lines)
+        embed.set_footer(text=f"Всего званий: {len(ranks_cursor)}")
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="achievements_list", description="Показать все доступные достижения по категориям")
+    async def achievements_list(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        achievements_cursor = await self.achievements.find().sort("xp", 1).to_list(length=None)
+
+        if not achievements_cursor:
+            return await interaction.followup.send("В базе нет ни одного достижения.")
+
+        # Группируем достижения по категориям, сохраняя порядок первого появления
+        categories: dict[str, list] = {}
+        for ach in achievements_cursor:
+            cat = ach.get("category") or "Без категории"
+            if cat not in categories:
+                categories[cat] = []
+            categories[cat].append(ach)
+
+        total_achievements = len(achievements_cursor)
+        header = f"📋 Всего достижений: **{total_achievements}**, категорий: **{len(categories)}**"
+        await interaction.followup.send(content=header)
+
+        # Каждый embed отправляем ОТДЕЛЬНЫМ сообщением.
+        # Причина: Discord ограничивает суммарный размер всех embed в одном
+        # сообщении в 6000 символов. При большом числе ачивок это ограничение
+        # легко превышается даже при одном embed на категорию.
+        for cat_name, achs in categories.items():
+            lines = []
+            for ach in achs:
+                role = interaction.guild.get_role(ach["_id"])
+                role_display = role.mention if role else f"`ID: {ach['_id']}`"
+                desc = ach.get("description", "—")
+                lines.append(f"`{ach['xp']:>3} XP` {role_display} — {desc}")
+
+            # Разбиваем категорию на части, если описание не влезает в один embed
+            chunks = []
+            current_chunk: list[str] = []
+            current_len = 0
+
+            for line in lines:
+                line_len = len(line) + 1  # +1 на символ переноса строки
+                if current_len + line_len > EMBED_DESCRIPTION_LIMIT:
+                    chunks.append("\n".join(current_chunk))
+                    current_chunk = [line]
+                    current_len = line_len
+                else:
+                    current_chunk.append(line)
+                    current_len += line_len
+
+            if current_chunk:
+                chunks.append("\n".join(current_chunk))
+
+            # Отправляем каждый кусок отдельным сообщением с одним embed
+            for part_idx, chunk in enumerate(chunks):
+                title = f"🏅 {cat_name}"
+                if len(chunks) > 1:
+                    title += f" (часть {part_idx + 1}/{len(chunks)})"
+
+                embed = discord.Embed(
+                    title=title,
+                    description=chunk,
+                    color=discord.Color.blue()
+                )
+                if part_idx == len(chunks) - 1:
+                    # Футер только на последней части категории
+                    embed.set_footer(text=f"Достижений в категории: {len(achs)}")
+
+                await interaction.followup.send(embed=embed)
+
+    # ==========================================
     # УПРАВЛЕНИЕ АЧИВКАМИ
     # ==========================================
 
     @app_commands.command(name="add_achievement", description="[АДМИН] Добавить роль как ачивку")
     @is_bot_admin()
-    async def add_achievement(self, interaction: discord.Interaction, role: discord.Role, xp: int, description: str):
+    async def add_achievement(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+        xp: int,
+        description: str,
+        category: str = "Без категории"
+    ):
         await interaction.response.defer(ephemeral=True)
 
         if await self.achievements.find_one({"_id": role.id}):
@@ -128,21 +237,73 @@ class XPSystem(commands.Cog):
         if await self.ranks.find_one({"_id": role.id}):
             return await interaction.followup.send(f"❌ Ошибка логики! Роль {role.mention} уже используется как **звание**.")
 
-        await self.achievements.insert_one({"_id": role.id, "xp": xp, "description": description})
-        logger.info(f"Админ {interaction.user} добавил ачивку {role.name} ({xp} XP).")
-        await interaction.followup.send(f"✅ Ачивка {role.mention} сохранена! Дает **{xp} XP**.\n📝 Описание: {description}")
+        await self.achievements.insert_one({
+            "_id": role.id,
+            "xp": xp,
+            "description": description,
+            "category": category
+        })
+        logger.info(f"Админ {interaction.user} добавил ачивку {role.name} ({xp} XP, категория: {category}).")
+        await interaction.followup.send(
+            f"✅ Ачивка {role.mention} сохранена!\n"
+            f"⚡ Даёт **{xp} XP**\n"
+            f"📂 Категория: **{category}**\n"
+            f"📝 Описание: {description}"
+        )
 
-    @app_commands.command(name="edit_achievement", description="[АДМИН] Изменить XP или описание у существующей ачивки")
+    @app_commands.command(name="edit_achievement", description="[АДМИН] Изменить XP, описание или категорию ачивки")
     @is_bot_admin()
-    async def edit_achievement(self, interaction: discord.Interaction, role: discord.Role, new_xp: int, new_description: str):
+    async def edit_achievement(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+        new_xp: int,
+        new_description: str,
+        new_category: str = None
+    ):
         await interaction.response.defer(ephemeral=True)
 
-        if not await self.achievements.find_one({"_id": role.id}):
+        existing = await self.achievements.find_one({"_id": role.id})
+        if not existing:
             return await interaction.followup.send(f"❌ Роль {role.mention} не найдена в списке ачивок. Сначала добавьте её через `/add_achievement`.")
 
-        await self.achievements.update_one({"_id": role.id}, {"$set": {"xp": new_xp, "description": new_description}})
+        update_data = {"xp": new_xp, "description": new_description}
+        # Обновляем категорию только если она явно передана
+        if new_category is not None:
+            update_data["category"] = new_category
+
+        await self.achievements.update_one({"_id": role.id}, {"$set": update_data})
         logger.info(f"Админ {interaction.user} изменил ачивку {role.name} на {new_xp} XP.")
-        await interaction.followup.send(f"✏️ Ачивка {role.mention} успешно обновлена! Теперь дает **{new_xp} XP**.")
+
+        category_info = f"\n📂 Категория: **{new_category}**" if new_category else ""
+        await interaction.followup.send(
+            f"✏️ Ачивка {role.mention} успешно обновлена!\n"
+            f"⚡ Теперь даёт **{new_xp} XP**{category_info}"
+        )
+
+    @app_commands.command(name="set_achievement_category", description="[АДМИН] Установить категорию для существующей ачивки")
+    @is_bot_admin()
+    async def set_achievement_category(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+        category: str
+    ):
+        """Позволяет задать/изменить категорию ачивки без смены других параметров."""
+        await interaction.response.defer(ephemeral=True)
+
+        existing = await self.achievements.find_one({"_id": role.id})
+        if not existing:
+            return await interaction.followup.send(f"❌ Роль {role.mention} не найдена в списке ачивок.")
+
+        old_category = existing.get("category", "Без категории")
+        await self.achievements.update_one({"_id": role.id}, {"$set": {"category": category}})
+
+        logger.info(f"Админ {interaction.user} изменил категорию ачивки {role.name}: '{old_category}' → '{category}'.")
+        await interaction.followup.send(
+            f"✏️ Категория ачивки {role.mention} обновлена:\n"
+            f"**{old_category}** → **{category}**"
+        )
 
     @app_commands.command(name="remove_achievement", description="[АДМИН] Удалить ачивку из БД и забрать её у всех пользователей")
     @is_bot_admin()
@@ -237,7 +398,7 @@ class XPSystem(commands.Cog):
     @app_commands.command(name="check_profile", description="[АДМИН] Посмотреть профиль XP и звания конкретного бойца")
     @is_bot_admin()
     async def check_profile(self, interaction: discord.Interaction, member: discord.Member):
-        await interaction.response.defer()#ephemeral=True)
+        await interaction.response.defer()
 
         if self.bot.config["CLAN_ROLE_ID"] not in [r.id for r in member.roles]:
             return await interaction.followup.send(f"⚠️ У {member.mention} нет клановой роли — профиль недоступен.")
