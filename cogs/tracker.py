@@ -11,6 +11,8 @@ import asyncio
 
 logger = logging.getLogger("SquadBot")
 SEED_THRESHOLD = 50
+TRAINING_SERVER_MARKER = "[FREE] Zone"
+TRAINING_SERVER_NAME = "[FREE] Zone - Training Server"
 
 # Названия карт Squad - такие записи не являются реальным сервером и игнорируются
 SQUAD_MAP_NAMES = {
@@ -51,7 +53,7 @@ class ActivityTracker(commands.Cog):
 
     def parse_squad_info(self, activity):
         """
-        Возвращает (server_name, is_seed) или (None, False) если запись не валидна
+        Возвращает (server_name, is_seed, is_training) или (None, False, False) если запись не валидна
         (Main Menu, название карты вместо сервера).
         """
         raw_text = activity.large_image_text or activity.details or ""
@@ -59,11 +61,14 @@ class ActivityTracker(commands.Cog):
 
         # Пункт 1: игнорируем Main Menu
         if server_name == "Main Menu":
-            return None, False
+            return None, False, False
 
         # Пункт 2: игнорируем записи, которые являются названием карты, а не сервера
         if server_name.lower() in SQUAD_MAP_NAMES:
-            return None, False
+            return None, False, False
+
+        if TRAINING_SERVER_MARKER in server_name:
+            return TRAINING_SERVER_NAME, False, True
 
         is_seed = False
         details = activity.details or ""
@@ -71,7 +76,7 @@ class ActivityTracker(commands.Cog):
         if match and int(match.group(1)) < SEED_THRESHOLD:
             is_seed = True
 
-        return server_name.replace(".", "_").replace("$", ""), is_seed
+        return server_name.replace(".", "_").replace("$", ""), is_seed, False
 
     @tasks.loop(minutes=1)
     async def track_activity(self):
@@ -109,17 +114,25 @@ class ActivityTracker(commands.Cog):
                     )
 
                     if current_squad:
-                        srv_name, is_seed = self.parse_squad_info(current_squad)
-                        # srv_name == None означает Main Menu или название карты — пропускаем
+                        srv_name, is_seed, is_training = self.parse_squad_info(current_squad)
                         if srv_name is not None:
-                            active_users[steam_id] = {"server": srv_name, "is_seed": is_seed}
+                            active_users[steam_id] = {
+                                "server": srv_name,
+                                "is_seed": is_seed,
+                                "is_training": is_training
+                            }
 
             if active_users:
                 global_ops = []
                 daily_ops = []
 
                 for steam_id, info in active_users.items():
-                    prefix = "seeding" if info["is_seed"] else "battle"
+                    if info["is_training"]:
+                        prefix = "training"
+                    elif info["is_seed"]:
+                        prefix = "seeding"
+                    else:
+                        prefix = "battle"
 
                     global_ops.append(UpdateOne(
                         {"_id": str(steam_id)},
@@ -169,8 +182,13 @@ class ActivityTracker(commands.Cog):
         cursor = self.daily_activity.find({"steam_id": steam_id, "date": {"$gte": target_date}})
 
         aggregated_data = {
-            "total_battle_minutes": 0, "total_seeding_minutes": 0, "total_minutes": 0,
-            "battle_servers": {}, "seeding_servers": {}
+            "total_battle_minutes": 0,
+            "total_seeding_minutes": 0,
+            "total_training_minutes": 0,
+            "total_minutes": 0,
+            "battle_servers": {},
+            "seeding_servers": {},
+            "training_servers": {}
         }
 
         has_data = False
@@ -179,11 +197,14 @@ class ActivityTracker(commands.Cog):
             aggregated_data["total_minutes"] += doc.get("total_minutes", 0)
             aggregated_data["total_battle_minutes"] += doc.get("total_battle_minutes", 0)
             aggregated_data["total_seeding_minutes"] += doc.get("total_seeding_minutes", 0)
+            aggregated_data["total_training_minutes"] += doc.get("total_training_minutes", 0)
 
             for srv, mins in doc.get("battle_servers", {}).items():
                 aggregated_data["battle_servers"][srv] = aggregated_data["battle_servers"].get(srv, 0) + mins
             for srv, mins in doc.get("seeding_servers", {}).items():
                 aggregated_data["seeding_servers"][srv] = aggregated_data["seeding_servers"].get(srv, 0) + mins
+            for srv, mins in doc.get("training_servers", {}).items():
+                aggregated_data["training_servers"][srv] = aggregated_data["training_servers"].get(srv, 0) + mins
 
         return aggregated_data if has_data else None
 
@@ -191,11 +212,13 @@ class ActivityTracker(commands.Cog):
     # ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: аддитивный мёрж серверов
     # ==========================================
     def _merge_servers(self, data: dict) -> dict:
-        """Суммирует battle_servers и seeding_servers без перезаписи ключей."""
+        """Суммирует battle_servers, seeding_servers и training_servers без перезаписи ключей."""
         all_srv = {}
         for srv, mins in data.get("battle_servers", {}).items():
             all_srv[srv] = all_srv.get(srv, 0) + mins
         for srv, mins in data.get("seeding_servers", {}).items():
+            all_srv[srv] = all_srv.get(srv, 0) + mins
+        for srv, mins in data.get("training_servers", {}).items():
             all_srv[srv] = all_srv.get(srv, 0) + mins
         return all_srv
 
@@ -236,6 +259,7 @@ class ActivityTracker(commands.Cog):
                 .zero {{ color: #ed4245; font-weight: bold; }}
                 .good {{ color: #57F287; font-weight: bold; }}
                 .nick {{ color: #fee75c; font-weight: bold; }}
+                .training {{ color: #eb459e; font-weight: bold; }}
             </style>
         </head>
         <body>
@@ -249,6 +273,7 @@ class ActivityTracker(commands.Cog):
                         <th>Steam ID</th>
                         <th>Бой (ч)</th>
                         <th>Сидинг (ч)</th>
+                        <th>Тренировки (ч)</th>
                         <th>Всего (ч)</th>
                         <th>Все посещенные серверы (по убыванию времени)</th>
                     </tr>
@@ -264,12 +289,15 @@ class ActivityTracker(commands.Cog):
             act = act_dict.get(steam_id, {})
             battle_h = act.get("total_battle_minutes", 0) / 60
             seed_h = act.get("total_seeding_minutes", 0) / 60
+            training_h = act.get("total_training_minutes", 0) / 60
             total_h = act.get("total_minutes", 0) / 60
 
             user_servers = {}
             for srv_name, mins in act.get("battle_servers", {}).items():
                 user_servers[srv_name] = user_servers.get(srv_name, 0) + mins
             for srv_name, mins in act.get("seeding_servers", {}).items():
+                user_servers[srv_name] = user_servers.get(srv_name, 0) + mins
+            for srv_name, mins in act.get("training_servers", {}).items():
                 user_servers[srv_name] = user_servers.get(srv_name, 0) + mins
 
             sorted_servers = sorted(user_servers.items(), key=lambda x: x[1], reverse=True)
@@ -291,6 +319,7 @@ class ActivityTracker(commands.Cog):
                     <td><code>{steam_id}</code></td>
                     <td>{battle_h:.1f}</td>
                     <td>{seed_h:.1f}</td>
+                    <td class="training">{training_h:.1f}</td>
                     <td class="{total_class}">{total_h:.1f}</td>
                     <td>{server_html}</td>
                 </tr>
@@ -375,6 +404,7 @@ class ActivityTracker(commands.Cog):
 
         battle_h = data.get("total_battle_minutes", 0) / 60
         seed_h = data.get("total_seeding_minutes", 0) / 60
+        training_h = data.get("total_training_minutes", 0) / 60
         total_h = data.get("total_minutes", 0) / 60
 
         embed = discord.Embed(
@@ -385,6 +415,7 @@ class ActivityTracker(commands.Cog):
         embed.add_field(name="⏱️ Всего", value=f"**{total_h:.1f} ч.**", inline=False)
         embed.add_field(name="⚔️ Бой", value=f"{battle_h:.1f} ч.", inline=True)
         embed.add_field(name="🌱 Сидинг", value=f"{seed_h:.1f} ч.", inline=True)
+        embed.add_field(name="🎯 Тренировки", value=f"{training_h:.1f} ч.", inline=True)
 
         top_srv = sorted(self._merge_servers(data).items(), key=lambda x: x[1], reverse=True)[:5]
         srv_str = "\n".join([f"• {n}: {m/60:.1f}ч" for n, m in top_srv]) or "Нет данных"
@@ -415,12 +446,15 @@ class ActivityTracker(commands.Cog):
 
         battle_h = data.get("total_battle_minutes", 0) / 60
         seed_h = data.get("total_seeding_minutes", 0) / 60
+        training_h = data.get("total_training_minutes", 0) / 60
         total_h = data.get("total_minutes", 0) / 60
 
         embed = discord.Embed(title=f"Твоя статистика: {squad_nick}", description=f"Период: **{period_name}**", color=0x2ecc71)
         embed.add_field(name="⏱️ Всего наиграно", value=f"**{total_h:.1f} ч.**", inline=False)
         embed.add_field(name="⚔️ Время в бою", value=f"**{battle_h:.1f} ч.**", inline=True)
         embed.add_field(name="🌱 Время сидинга", value=f"**{seed_h:.1f} ч.**", inline=True)
+        if training_h > 0:
+            embed.add_field(name="🎯 Тренировки", value=f"**{training_h:.1f} ч.**", inline=True)
 
         top_srv = sorted(self._merge_servers(data).items(), key=lambda x: x[1], reverse=True)[:3]
         if top_srv:
@@ -485,6 +519,8 @@ class ActivityTracker(commands.Cog):
                 server_totals[srv_name] = server_totals.get(srv_name, 0) + minutes
             for srv_name, minutes in doc.get("seeding_servers", {}).items():
                 server_totals[srv_name] = server_totals.get(srv_name, 0) + minutes
+            for srv_name, minutes in doc.get("training_servers", {}).items():
+                server_totals[srv_name] = server_totals.get(srv_name, 0) + minutes
 
         if not server_totals:
             return await interaction.followup.send(f"Данных о серверах за **{period_name}** пока нет.")
@@ -515,6 +551,7 @@ class ActivityTracker(commands.Cog):
                 "_id": None,
                 "overall_battle": {"$sum": "$total_battle_minutes"},
                 "overall_seeding": {"$sum": "$total_seeding_minutes"},
+                "overall_training": {"$sum": "$total_training_minutes"},
                 "overall_total": {"$sum": "$total_minutes"}
             }
         })
@@ -529,6 +566,7 @@ class ActivityTracker(commands.Cog):
         total_h = stats.get("overall_total", 0) / 60
         battle_h = stats.get("overall_battle", 0) / 60
         seed_h = stats.get("overall_seeding", 0) / 60
+        training_h = stats.get("overall_training", 0) / 60
 
         player_count = len(await collection.distinct(
             "steam_id" if period_val != "all" else "_id",
@@ -539,6 +577,7 @@ class ActivityTracker(commands.Cog):
         embed.add_field(name="Всего наиграно", value=f"**{total_h:.1f} ч.**", inline=False)
         embed.add_field(name="В боях", value=f"{battle_h:.1f} ч.", inline=True)
         embed.add_field(name="На сидинге", value=f"{seed_h:.1f} ч.", inline=True)
+        embed.add_field(name="На тренировках", value=f"{training_h:.1f} ч.", inline=True)
         embed.set_footer(text=f"Активных бойцов за этот период: {player_count}")
         await interaction.followup.send(embed=embed)
 
