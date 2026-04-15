@@ -98,9 +98,10 @@ class XPSystem(commands.Cog):
             next_role_name = next_role.name if next_role else "???"
             req_xp = next_rank["required_xp"]
 
-            progress = int((total_xp / req_xp) * 10) if req_xp > 0 else 10
-            progress = max(0, min(10, progress))
-            bar = "🟩" * progress + "⬛" * (10 - progress)
+            bar_length = 8
+            progress = int((total_xp / req_xp) * bar_length) if req_xp > 0 else bar_length
+            progress = max(0, min(bar_length, progress))
+            bar = "🟩" * progress + "⬛" * (bar_length - progress)
 
             embed.add_field(
                 name=f"📈 До звания «{next_role_name}»",
@@ -140,24 +141,25 @@ class XPSystem(commands.Cog):
         for i, rank in enumerate(ranks_cursor):
             role = interaction.guild.get_role(rank["_id"])
             role_display = role.mention if role else f"`ID: {rank['_id']}`"
-            # Добавляем корону к последнему (максимальному) званию
-            #crown = " 👑" if i == len(ranks_cursor) - 1 else ""
             lines.append(f"**{rank['required_xp']} XP** — {role_display}")
 
         embed.description = "\n".join(lines)
         embed.set_footer(text=f"Всего званий: {len(ranks_cursor)}")
         await interaction.followup.send(embed=embed)
 
-    @app_commands.command(name="achievements_list", description="Показать все доступные достижения по категориям")
-    async def achievements_list(self, interaction: discord.Interaction):
+    @app_commands.command(name="achievements_list", description="Показать все доступные достижения (или по конкретной категории)")
+    @app_commands.describe(category="Выберите категорию для фильтрации (необязательно)")
+    async def achievements_list(self, interaction: discord.Interaction, category: str = None):
         await interaction.response.defer()
 
-        achievements_cursor = await self.achievements.find().sort("xp", 1).to_list(length=None)
+        query = {"category": category} if category else {}
+        achievements_cursor = await self.achievements.find(query).sort("xp", 1).to_list(length=None)
 
         if not achievements_cursor:
+            if category:
+                return await interaction.followup.send(f"В категории **{category}** пока нет достижений.")
             return await interaction.followup.send("В базе нет ни одного достижения.")
 
-        # Группируем достижения по категориям, сохраняя порядок первого появления
         categories: dict[str, list] = {}
         for ach in achievements_cursor:
             cat = ach.get("category") or "Без категории"
@@ -166,13 +168,14 @@ class XPSystem(commands.Cog):
             categories[cat].append(ach)
 
         total_achievements = len(achievements_cursor)
-        header = f"📋 Всего достижений: **{total_achievements}**, категорий: **{len(categories)}**"
+        
+        if category:
+            header = f"📋 Категория: **{category}** | Достижений: **{total_achievements}**"
+        else:
+            header = f"📋 Всего достижений: **{total_achievements}**, категорий: **{len(categories)}**"
+            
         await interaction.followup.send(content=header)
 
-        # Каждый embed отправляем ОТДЕЛЬНЫМ сообщением.
-        # Причина: Discord ограничивает суммарный размер всех embed в одном
-        # сообщении в 6000 символов. При большом числе ачивок это ограничение
-        # легко превышается даже при одном embed на категорию.
         for cat_name, achs in categories.items():
             lines = []
             for ach in achs:
@@ -181,13 +184,12 @@ class XPSystem(commands.Cog):
                 desc = ach.get("description", "—")
                 lines.append(f"`{ach['xp']:>3} XP` {role_display} — {desc}")
 
-            # Разбиваем категорию на части, если описание не влезает в один embed
             chunks = []
             current_chunk: list[str] = []
             current_len = 0
 
             for line in lines:
-                line_len = len(line) + 1  # +1 на символ переноса строки
+                line_len = len(line) + 1
                 if current_len + line_len > EMBED_DESCRIPTION_LIMIT:
                     chunks.append("\n".join(current_chunk))
                     current_chunk = [line]
@@ -199,7 +201,6 @@ class XPSystem(commands.Cog):
             if current_chunk:
                 chunks.append("\n".join(current_chunk))
 
-            # Отправляем каждый кусок отдельным сообщением с одним embed
             for part_idx, chunk in enumerate(chunks):
                 title = f"🏅 {cat_name}"
                 if len(chunks) > 1:
@@ -211,10 +212,23 @@ class XPSystem(commands.Cog):
                     color=discord.Color.blue()
                 )
                 if part_idx == len(chunks) - 1:
-                    # Футер только на последней части категории
-                    embed.set_footer(text=f"Достижений в категории: {len(achs)}")
+                    embed.set_footer(text=f"Достижений: {len(achs)}")
 
                 await interaction.followup.send(embed=embed)
+
+    @achievements_list.autocomplete("category")
+    async def category_autocomplete(self, interaction: discord.Interaction, current: str):
+        unique_categories = await self.achievements.distinct("category")
+        
+        cleaned_categories = [c if c else "Без категории" for c in unique_categories]
+        
+        choices = [
+            app_commands.Choice(name=cat, value=cat)
+            for cat in cleaned_categories
+            if current.lower() in cat.lower()
+        ]
+        
+        return choices[:25]
 
     # ==========================================
     # УПРАВЛЕНИЕ АЧИВКАМИ
@@ -268,7 +282,6 @@ class XPSystem(commands.Cog):
             return await interaction.followup.send(f"❌ Роль {role.mention} не найдена в списке ачивок. Сначала добавьте её через `/add_achievement`.")
 
         update_data = {"xp": new_xp, "description": new_description}
-        # Обновляем категорию только если она явно передана
         if new_category is not None:
             update_data["category"] = new_category
 
