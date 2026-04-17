@@ -240,57 +240,17 @@ class ActivityTracker(commands.Cog):
         act_dict = {doc["_id"]: doc for doc in activity_cursor}
         current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        html = f"""
-        <!DOCTYPE html>
-        <html lang="ru">
-        <head>
-            <meta charset="UTF-8">
-            <title>Отчет по активности клана</title>
-            <style>
-                body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #2c2f33; color: #ffffff; margin: 30px; }}
-                h1 {{ color: #7289da; text-align: center; margin-bottom: 5px; }}
-                .date {{ text-align: center; color: #99aab5; margin-bottom: 20px; font-size: 14px; }}
-                table {{ width: 100%; border-collapse: collapse; background-color: #23272a; box-shadow: 0 4px 8px rgba(0,0,0,0.3); border-radius: 8px; overflow: hidden; }}
-                th, td {{ padding: 12px 15px; text-align: left; border-bottom: 1px solid #2c2f33; }}
-                th {{ background-color: #7289da; color: white; text-transform: uppercase; font-size: 13px; font-weight: bold; }}
-                tr:hover {{ background-color: #2a2d32; }}
-                .server-list {{ margin: 0; padding-left: 20px; font-size: 13px; color: #b9bbbe; }}
-                .server-list li {{ margin-bottom: 3px; }}
-                .zero {{ color: #ed4245; font-weight: bold; }}
-                .good {{ color: #57F287; font-weight: bold; }}
-                .nick {{ color: #fee75c; font-weight: bold; }}
-                .training {{ color: #eb459e; font-weight: bold; }}
-            </style>
-        </head>
-        <body>
-            <h1>📊 Детальный отчет по активности клана (За всё время)</h1>
-            <div class="date">Сгенерировано: {current_time}</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Discord Ник</th>
-                        <th>Squad Ник</th>
-                        <th>Steam ID</th>
-                        <th>Бой (ч)</th>
-                        <th>Сидинг (ч)</th>
-                        <th>Тренировки (ч)</th>
-                        <th>Всего (ч)</th>
-                        <th>Все посещенные серверы (по убыванию времени)</th>
-                    </tr>
-                </thead>
-                <tbody>
-        """
-
+        rows = []
         for u in users_cursor:
             steam_id = u.get("steam_id", "Unknown")
-            d_name = u.get("discord_name", "Unknown")
-            s_nick = u.get("squad_nickname", "Unknown")
+            d_name   = u.get("discord_name", "Unknown")
+            s_nick   = u.get("squad_nickname", "Unknown")
 
-            act = act_dict.get(steam_id, {})
+            act      = act_dict.get(steam_id, {})
             battle_h = act.get("total_battle_minutes", 0) / 60
-            seed_h = act.get("total_seeding_minutes", 0) / 60
-            training_h = act.get("total_training_minutes", 0) / 60
-            total_h = act.get("total_minutes", 0) / 60
+            seed_h   = act.get("total_seeding_minutes", 0) / 60
+            train_h  = act.get("total_training_minutes", 0) / 60
+            total_h  = act.get("total_minutes", 0) / 60
 
             user_servers = {}
             for srv_name, mins in act.get("battle_servers", {}).items():
@@ -301,36 +261,243 @@ class ActivityTracker(commands.Cog):
                 user_servers[srv_name] = user_servers.get(srv_name, 0) + mins
 
             sorted_servers = sorted(user_servers.items(), key=lambda x: x[1], reverse=True)
+            rows.append((d_name, s_nick, steam_id, battle_h, seed_h, train_h, total_h, sorted_servers))
 
-            server_html = "<ul class='server-list'>"
-            if sorted_servers:
-                for name, mins in sorted_servers:
-                    server_html += f"<li>{name}: <b>{mins/60:.1f} ч.</b></li>"
-            else:
-                server_html += "<li><i>Нет активности</i></li>"
-            server_html += "</ul>"
+        rows.sort(key=lambda r: r[6], reverse=True)
 
+        tbody_html = ""
+        for idx, (d_name, s_nick, steam_id, battle_h, seed_h, train_h, total_h, sorted_servers) in enumerate(rows, 1):
             total_class = "zero" if total_h == 0 else "good"
 
-            html += f"""
-                <tr>
-                    <td>{d_name}</td>
-                    <td class="nick">{s_nick}</td>
-                    <td><code>{steam_id}</code></td>
-                    <td>{battle_h:.1f}</td>
-                    <td>{seed_h:.1f}</td>
-                    <td class="training">{training_h:.1f}</td>
-                    <td class="{total_class}">{total_h:.1f}</td>
-                    <td>{server_html}</td>
-                </tr>
-            """
+            if sorted_servers:
+                srv_items = "".join(
+                    f"<li>{name}: <b>{mins/60:.1f} ч.</b></li>"
+                    for name, mins in sorted_servers
+                )
+                server_html = (
+                    f"<details>"
+                    f"<summary class='srv-summary'>Серверов: {len(sorted_servers)}</summary>"
+                    f"<ul class='server-list'>{srv_items}</ul>"
+                    f"</details>"
+                )
+            else:
+                server_html = "<span class='no-data'>Нет активности</span>"
 
-        html += """
-                </tbody>
-            </table>
-        </body>
-        </html>
-        """
+            tbody_html += (
+                f"<tr>"
+                f"<td class='num'>{idx}</td>"
+                f"<td>{d_name}</td>"
+                f"<td class='nick'>{s_nick}</td>"
+                f"<td><code>{steam_id}</code></td>"
+                f"<td data-val='{battle_h:.2f}'>{battle_h:.1f}</td>"
+                f"<td data-val='{seed_h:.2f}'>{seed_h:.1f}</td>"
+                f"<td class='training' data-val='{train_h:.2f}'>{train_h:.1f}</td>"
+                f"<td class='{total_class}' data-val='{total_h:.2f}'>{total_h:.1f}</td>"
+                f"<td>{server_html}</td>"
+                f"</tr>\n"
+            )
+
+        html = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Отчет по активности клана</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; }}
+    body {{
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #1e2124;
+      color: #dcddde;
+      margin: 0;
+      padding: 24px 32px;
+    }}
+    h1 {{ color: #7289da; text-align: center; margin-bottom: 4px; font-size: 22px; }}
+    .date {{ text-align: center; color: #72767d; margin-bottom: 18px; font-size: 13px; }}
+
+    /* ── Панель управления ── */
+    .controls {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }}
+    #searchInput {{
+      flex: 1;
+      min-width: 220px;
+      padding: 8px 12px;
+      border-radius: 6px;
+      border: 1px solid #40444b;
+      background: #2f3136;
+      color: #dcddde;
+      font-size: 14px;
+      outline: none;
+      transition: border-color .2s;
+    }}
+    #searchInput:focus {{ border-color: #7289da; }}
+    #searchInput::placeholder {{ color: #72767d; }}
+    .count-badge {{ color: #72767d; font-size: 13px; white-space: nowrap; }}
+
+    /* ── Таблица ── */
+    .table-wrap {{
+      overflow-x: auto;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0,0,0,.4);
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      background-color: #23272a;
+      min-width: 860px;
+    }}
+    th, td {{
+      padding: 10px 13px;
+      text-align: left;
+      border-bottom: 1px solid #2c2f33;
+      white-space: nowrap;
+    }}
+    td:last-child {{ white-space: normal; min-width: 180px; }}
+    th {{
+      background-color: #2f3136;
+      color: #b9bbbe;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      cursor: pointer;
+      user-select: none;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }}
+    th.no-sort {{ cursor: default; }}
+    th:not(.no-sort):hover {{ background-color: #36393f; color: #ffffff; }}
+    th.sort-asc::after  {{ content: " ▲"; color: #7289da; }}
+    th.sort-desc::after {{ content: " ▼"; color: #7289da; }}
+    tr:hover {{ background-color: #2a2d32; }}
+    tr.hidden {{ display: none; }}
+
+    /* ── Ячейки ── */
+    .num      {{ color: #72767d; font-size: 12px; text-align: center; width: 36px; }}
+    .zero     {{ color: #ed4245; font-weight: 700; }}
+    .good     {{ color: #57f287; font-weight: 700; }}
+    .nick     {{ color: #fee75c; font-weight: 700; }}
+    .training {{ color: #eb459e; font-weight: 700; }}
+    .no-data  {{ color: #4f545c; font-style: italic; font-size: 13px; }}
+
+    /* ── Серверы (details) ── */
+    details {{ cursor: pointer; }}
+    .srv-summary {{
+      list-style: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: #36393f;
+      font-size: 12px;
+      color: #b9bbbe;
+      transition: background .15s;
+    }}
+    .srv-summary::-webkit-details-marker {{ display: none; }}
+    .srv-summary::before {{ content: "▶"; font-size: 9px; color: #7289da; transition: transform .15s; }}
+    details[open] .srv-summary::before {{ transform: rotate(90deg); }}
+    details[open] .srv-summary {{ background: #40444b; color: #ffffff; }}
+    .server-list {{
+      margin: 6px 0 2px 4px;
+      padding: 0;
+      list-style: none;
+      font-size: 13px;
+      color: #b9bbbe;
+    }}
+    .server-list li {{ padding: 2px 0; border-bottom: 1px solid #2c2f3344; }}
+    .server-list li:last-child {{ border-bottom: none; }}
+  </style>
+</head>
+<body>
+  <h1>📊 Детальный отчет по активности клана (За всё время)</h1>
+  <div class="date">Сгенерировано: {current_time}</div>
+
+  <div class="controls">
+    <input id="searchInput" type="text" placeholder="🔍  Поиск по нику, Steam ID…" oninput="filterTable()">
+    <span class="count-badge" id="countBadge"></span>
+  </div>
+
+  <div class="table-wrap">
+    <table id="mainTable">
+      <thead>
+        <tr>
+          <th class="no-sort">№</th>
+          <th>Discord Ник</th>
+          <th>Squad Ник</th>
+          <th>Steam ID</th>
+          <th>Бой (ч)</th>
+          <th>Сидинг (ч)</th>
+          <th>Трен. (ч)</th>
+          <th>Всего (ч)</th>
+          <th class="no-sort">Серверы</th>
+        </tr>
+      </thead>
+      <tbody id="tableBody">
+{tbody_html}
+      </tbody>
+    </table>
+  </div>
+
+<script>
+  function updateCount() {{
+    const total   = document.querySelectorAll('#tableBody tr').length;
+    const visible = document.querySelectorAll('#tableBody tr:not(.hidden)').length;
+    const badge   = document.getElementById('countBadge');
+    badge.textContent = visible === total
+      ? `Всего бойцов: ${{total}}`
+      : `Показано: ${{visible}} / ${{total}}`;
+  }}
+
+  function filterTable() {{
+    const q = document.getElementById('searchInput').value.toLowerCase();
+    document.querySelectorAll('#tableBody tr').forEach(row => {{
+      row.classList.toggle('hidden', q !== '' && !row.textContent.toLowerCase().includes(q));
+    }});
+    renumber();
+    updateCount();
+  }}
+
+  function renumber() {{
+    let n = 1;
+    document.querySelectorAll('#tableBody tr:not(.hidden)').forEach(row => {{
+      row.cells[0].textContent = n++;
+    }});
+  }}
+
+  let lastCol = -1, lastDir = 1;
+  document.querySelectorAll('#mainTable thead th').forEach((th, colIdx) => {{
+    if (th.classList.contains('no-sort')) return;
+    th.addEventListener('click', () => {{
+      const dir = (colIdx === lastCol) ? -lastDir : -1;   // первый клик — по убыванию
+      lastCol = colIdx; lastDir = dir;
+      document.querySelectorAll('#mainTable thead th').forEach(h => h.classList.remove('sort-asc', 'sort-desc'));
+      th.classList.add(dir === -1 ? 'sort-desc' : 'sort-asc');
+
+      const tbody = document.getElementById('tableBody');
+      Array.from(tbody.querySelectorAll('tr'))
+        .sort((a, b) => {{
+          const ca = a.cells[colIdx], cb = b.cells[colIdx];
+          const va = parseFloat(ca.dataset.val ?? ca.textContent);
+          const vb = parseFloat(cb.dataset.val ?? cb.textContent);
+          if (!isNaN(va) && !isNaN(vb)) return dir * (vb - va);
+          return dir * ca.textContent.trim().localeCompare(cb.textContent.trim(), 'ru');
+        }})
+        .forEach(r => tbody.appendChild(r));
+      renumber();
+      updateCount();
+    }});
+  }});
+
+  updateCount();
+</script>
+</body>
+</html>"""
 
         file = discord.File(io.BytesIO(html.encode("utf-8")), filename="clan_activity_report.html")
         await interaction.followup.send("**HTML-отчет успешно сгенерирован!**", file=file)
